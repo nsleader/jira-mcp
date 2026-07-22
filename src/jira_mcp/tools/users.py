@@ -118,8 +118,9 @@ def register(mcp: FastMCP) -> None:
             limit: Maximum number of users to return (default 50).
             include_inactive: Include deactivated users in the result.
         """
+        # Jira Server/DC expects ``username``; ``query`` is Cloud-only.
         return get_jira().user_find_by_user_string(
-            query=query,
+            username=query,
             start=0,
             limit=limit,
             include_inactive_users=include_inactive,
