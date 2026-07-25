@@ -90,6 +90,8 @@ claude mcp add jira \
 | `get_all_teams`        | Список всех команд Tempo (id, название, лид)                     |
 | `find_team`            | Найти команды Tempo по названию (подстрока) → получить `teamId`  |
 | `get_team_members`     | Все участники команды Tempo (ключ, имя, роль, период членства)   |
+| `get_user_plan`        | Планы Tempo Planner: на какие проекты и на сколько часов в день запланирован пользователь |
+| `get_users_plan`       | Планы Tempo Planner по списку пользователей за один запрос, с разбивкой по каждому |
 
 ## Структура
 
@@ -100,13 +102,16 @@ src/jira_mcp/
 ├── server.py        # FastMCP + main()
 └── tools/
     ├── issues.py    # инструменты по задачам
-    └── tempo.py     # заглушка под Tempo Planning API
+    └── tempo.py     # Tempo Planner: планирование (get_user_plan)
 ```
 
-## Расширение под Tempo Planning
+## Tempo Planner
 
-Заготовка — `src/jira_mcp/tools/tempo.py`. Tempo использует собственный базовый URL
-и API-токен, поэтому интеграция получит отдельный HTTP-клиент и свои настройки.
+`get_user_plan` читает раздел планирования через `rest/tempo-planning/1/allocation`
+и рабочий календарь пользователя (`rest/tempo-core/1/user/schedule`), поэтому
+разбивка по дням не учитывает выходные и праздники — так же, как сам Tempo.
+На Server/DC это плагин Jira: работает тот же `JIRA_URL` и PAT, отдельный
+Tempo-токен не нужен.
 
 ## Разработка
 
