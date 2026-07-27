@@ -1,4 +1,4 @@
-"""Worklog reporting tools (Tempo Timesheets).
+"""Worklog tools: reporting (Tempo Timesheets) and logging time.
 
 Aggregates how much time users logged over a date range using the Tempo
 Timesheets API: a single search request returns every matching worklog for the
@@ -9,12 +9,17 @@ request too.
 Breakdowns compose. When ``day`` is combined with ``project`` and/or ``issue``,
 the project/issue totals are nested *inside each day* (hours per project/issue
 per day). Without ``day`` they are returned flat for the whole period.
+
+``add_worklog`` is the one write here — it posts to Jira's core worklog API
+(``rest/api/2/issue/{key}/worklog``) as the token's owner; Tempo on Server/DC
+reads the same worklogs, so logged time shows up in the reports above.
 """
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, time
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -27,6 +32,12 @@ _VALID_DIMS = {"day", "project", "issue", "account"}
 # Tempo account key/category marking non-working time (vacation, sick leave).
 # The English key is stable; the display name is localised ("Отсутствие").
 _ABSENCE_MARKERS = {"absence"}
+
+# Jira duration syntax accepted by the worklog API: "2h", "90m", "1d 4h".
+_TIME_SPENT_RE = re.compile(r"^\d+(\.\d+)?[wdhm](\s*\d+(\.\d+)?[wdhm])*$")
+_JIRA_DATETIME_FMT = "%Y-%m-%dT%H:%M:%S.000%z"
+# Hour of the day a date-only ``started`` is anchored at (see _parse_started).
+_DEFAULT_START_HOUR = 9
 
 
 def _seconds_to_hours(seconds: int) -> float:
@@ -501,6 +512,47 @@ def _fetch_team_members(team_id: int) -> dict[str, dict[str, Any]]:
     return members
 
 
+def _validate_time_spent(time_spent: str) -> str:
+    """Normalise a Jira duration (``2h 30m``), rejecting anything Jira can't parse."""
+    value = " ".join(time_spent.split()).lower()
+    if not _TIME_SPENT_RE.match(value):
+        raise ValueError(
+            f"time_spent '{time_spent}' is not a Jira duration: use a number plus "
+            f"w/d/h/m, space-separated — '2h', '90m', '2h 30m', '1d 4h'"
+        )
+    return value
+
+
+def _parse_started(started: str | None) -> str:
+    """Build Jira's ``started`` timestamp from a date, datetime or ``None``.
+
+    Jira wants ``yyyy-MM-dd'T'HH:mm:ss.SSSZ`` — an offset is mandatory, and it
+    decides which calendar day the worklog lands on. A bare ``YYYY-MM-DD`` is
+    therefore anchored at 09:00 *local* time rather than midnight UTC, which in
+    an eastern timezone would silently move the worklog to the previous day.
+    """
+    local_tz = datetime.now().astimezone().tzinfo
+    if not started:
+        moment = datetime.now(tz=local_tz)
+    else:
+        text = started.strip().replace(" ", "T", 1)
+        try:
+            if len(text) == 10:
+                moment = datetime.combine(
+                    date.fromisoformat(text), time(_DEFAULT_START_HOUR), tzinfo=local_tz
+                )
+            else:
+                moment = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(
+                f"started '{started}' is not a date or datetime: use 'YYYY-MM-DD', "
+                f"'YYYY-MM-DDTHH:MM', or a timestamp with an offset"
+            ) from exc
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=local_tz)
+    return moment.strftime(_JIRA_DATETIME_FMT)
+
+
 def register(mcp: FastMCP) -> None:
     """Attach worklog tools to the FastMCP instance."""
 
@@ -716,3 +768,68 @@ def register(mcp: FastMCP) -> None:
                 "workers": sorted(excluded, key=lambda w: excluded[w], reverse=True),
             }
         return result
+
+    @mcp.tool()
+    def add_worklog(
+        issue_key: str,
+        time_spent: str,
+        started: str | None = None,
+        comment: str | None = None,
+    ) -> dict[str, Any]:
+        """Log time on a Jira issue, as the user who owns the API token.
+
+        CALL THIS TOOL STRICTLY ON THE USER'S EXPLICIT REQUEST. It is the only
+        tool here that writes: it creates a real worklog under the user's name
+        and cannot be undone from this server. Never call it on your own
+        initiative — not after finishing a task, not to "correct" hours seen in
+        a report, not as a step inferred from some other request. If the user
+        has not asked to log time, ask them first.
+
+        Args:
+            issue_key: The issue to log against, e.g. ``PROJ-123``.
+            time_spent: Duration in Jira syntax — ``2h``, ``90m``, ``2h 30m``,
+                ``1d 4h`` (w/d/h/m). Jira converts it using the instance's
+                working day/week, so ``1d`` is usually 8h, not 24h.
+            started: When the work happened. ``YYYY-MM-DD`` (anchored at 09:00
+                local time), ``YYYY-MM-DDTHH:MM``, or a timestamp with an
+                offset. Defaults to now — pass the date explicitly when logging
+                for a past day.
+            comment: Optional worklog comment (plain text / Jira wiki markup).
+
+        Returns the created worklog: ``id``, ``time_spent``, ``started``,
+        ``author`` and a browse link to the issue.
+        """
+        payload: dict[str, Any] = {
+            "timeSpent": _validate_time_spent(time_spent),
+            "started": _parse_started(started),
+        }
+        if comment:
+            payload["comment"] = comment
+
+        jira = get_jira()
+        try:
+            resp = jira.issue_add_json_worklog(issue_key, payload)
+        except HTTPError as exc:
+            response = exc.response
+            status = response.status_code if response is not None else "?"
+            body = response.text.strip() if response is not None else str(exc)
+            raise RuntimeError(
+                f"Logging work failed (HTTP {status}) at "
+                f"'rest/api/2/issue/{issue_key}/worklog'. "
+                f"Payload: {payload}. Server response: {body[:800]}"
+            ) from exc
+
+        resp = resp if isinstance(resp, dict) else {}
+        author = resp.get("author") if isinstance(resp.get("author"), dict) else {}
+        seconds = int(resp.get("timeSpentSeconds") or 0)
+        return {
+            "id": resp.get("id"),
+            "issue_key": issue_key,
+            "time_spent": resp.get("timeSpent") or payload["timeSpent"],
+            "time_spent_seconds": seconds,
+            "hours": _seconds_to_hours(seconds),
+            "started": resp.get("started") or payload["started"],
+            "author": author.get("displayName") or author.get("name"),
+            "comment": resp.get("comment"),
+            "url": f"{jira.url.rstrip('/')}/browse/{issue_key}",
+        }
