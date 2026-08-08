@@ -87,6 +87,9 @@ claude mcp add jira \
 | `get_issue_types`      | Типы задач инстанса или конкретного проекта (что можно передать в `create_issue`) |
 | `create_issue`         | Создать эпик / задачу / подзадачу — **вызывается строго по явной просьбе пользователя** |
 | `add_worklog`          | Залогировать время на задачу — **вызывается строго по явной просьбе пользователя** |
+| `get_all_projects`     | Список всех проектов, видимых пользователю                        |
+| `get_project`          | Один проект по ключу или id                                      |
+| `get_project_roles`    | Роли проекта и их состав (пользователи и группы) — где искать реального РП |
 | `get_user_worklog`     | Часы одного пользователя за период (Tempo Timesheets)           |
 | `get_users_worklog`    | Часы по списку пользователей за период, с разбивкой по каждому  |
 | `get_team_worklog`     | Часы всех участников команды Tempo (`teamId`) за период — отчёт «Logged Time» |
@@ -105,6 +108,7 @@ src/jira_mcp/
 ├── server.py        # FastMCP + main()
 └── tools/
     ├── issues.py    # инструменты по задачам + create_issue
+    ├── projects.py  # проекты и роли проекта (get_project_roles)
     ├── worklogs.py  # отчёты по времени (Tempo Timesheets) + add_worklog
     └── tempo.py     # Tempo Planner: планирование (get_user_plan)
 ```
