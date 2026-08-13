@@ -21,11 +21,13 @@ Two things make Confluence awkward for an LLM and are handled here:
 
 from __future__ import annotations
 
+import html
 import re
+from collections.abc import Iterator
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from atlassian.errors import ApiValueError
+from atlassian.errors import ApiError, ApiValueError
 from bs4 import BeautifulSoup
 from markdownify import markdownify
 from mcp.server.fastmcp import FastMCP
@@ -38,6 +40,10 @@ _HIGHLIGHT_RE = re.compile(r"@@@(?:end)?hl@@@")
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 _FORMATS = ("markdown", "text", "html", "storage")
+
+# Page size and hard stop for walking `rest/api/space`.
+_SPACE_PAGE = 100
+_SPACE_MAX = 2000
 
 # `body.view` is the rendered page (macros resolved); `body.storage` is the raw
 # XHTML source. `history` carries the author/creation date, `metadata.labels`
@@ -62,17 +68,26 @@ def _base_url() -> str:
 
 
 def _absolute(link: str | None) -> str | None:
-    """Turn a Confluence-relative link (``/display/…``) into a full URL."""
+    """Turn a Confluence-relative link (``/display/…``) into a full URL.
+
+    Only site-relative paths are rewritten. Anything already addressable —
+    another host, a ``mailto:``/``tel:`` link, a protocol-relative URL, an
+    in-page anchor — is left alone; prefixing those produces dead links.
+    """
     if not link:
         return None
-    if link.startswith(("http://", "https://")):
+    if urlparse(link).scheme or link.startswith(("//", "#")):
         return link
     return f"{_base_url()}/{link.lstrip('/')}"
 
 
 def _clean_highlight(value: Any) -> str:
-    """Drop the ``@@@hl@@@`` match markers Server puts around search hits."""
-    return _HIGHLIGHT_RE.sub("", str(value or "")).strip()
+    """Clean a search hit's title or excerpt.
+
+    Server marks the matched words with ``@@@hl@@@`` and returns the snippet
+    HTML-escaped, so a quoted phrase arrives as ``&quot;…&quot;``.
+    """
+    return html.unescape(_HIGHLIGHT_RE.sub("", str(value or ""))).strip()
 
 
 def _escape_cql(value: str) -> str:
@@ -142,25 +157,32 @@ def _parse_page_reference(reference: str) -> tuple[str | None, tuple[str, str] |
     )
 
 
-def _to_markdown(html: str) -> str:
+def _to_markdown(markup: str) -> str:
     """Convert a rendered Confluence body to Markdown.
 
     Links are absolutised first: Confluence emits ``/display/…`` hrefs, which
-    are useless once they leave the browser.
+    are useless once they leave the browser. Markdown escaping of ``*`` and
+    ``_`` is switched off — wiki pages are full of both as ordinary
+    punctuation, and backslashes in front of them only obscure the text.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(markup, "html.parser")
     for tag, attr in (("a", "href"), ("img", "src")):
         for node in soup.find_all(tag):
             value = node.get(attr)
             if value:
                 node[attr] = _absolute(str(value))
-    text = markdownify(str(soup), heading_style="ATX")
+    text = markdownify(
+        str(soup),
+        heading_style="ATX",
+        escape_asterisks=False,
+        escape_underscores=False,
+    )
     return _BLANK_LINES_RE.sub("\n\n", text).strip()
 
 
-def _to_text(html: str) -> str:
+def _to_text(markup: str) -> str:
     """Flatten a body to plain text, keeping paragraph breaks."""
-    text = BeautifulSoup(html, "html.parser").get_text("\n")
+    text = BeautifulSoup(markup, "html.parser").get_text("\n")
     return _BLANK_LINES_RE.sub("\n\n", text).strip()
 
 
@@ -294,6 +316,9 @@ def _fetch_page(
         except HTTPError as exc:
             endpoint = f"rest/api/content/{page_id}"
             raise _http_error(f"page {page_id}", endpoint, exc) from exc
+        except ApiError as exc:
+            # The client turns a 404 here into its own (id-less) message.
+            raise RuntimeError(f"Confluence page {page_id}: {exc}") from exc
         if not isinstance(result, dict) or not result.get("id"):
             raise RuntimeError(f"Confluence returned no page for id {page_id}")
         return result
@@ -308,10 +333,34 @@ def _fetch_page(
         raise _http_error(f"page '{title}' in space '{space}'", endpoint, exc) from exc
     if not isinstance(result, dict) or not result.get("id"):
         raise RuntimeError(
-            f"No page titled '{title}' in space '{space}'. Titles must match exactly "
-            f"(they are case-sensitive) — use search_confluence to find the page."
+            f"No page titled '{title}' in space '{space}'. The whole title has to "
+            f"match — use search_confluence to find the page, then pass its id."
         )
     return result
+
+
+def _iter_spaces() -> Iterator[dict[str, Any]]:
+    """Yield every space on the instance, fetching one page at a time.
+
+    ``rest/api/space`` returns far fewer spaces than a real instance has, so
+    filtering a single response by name silently misses most of them. Lazily
+    paging keeps ``query`` honest while stopping as soon as the caller has
+    enough matches; ``_SPACE_MAX`` is only a runaway guard.
+    """
+    confluence = get_confluence()
+    start = 0
+    while start < _SPACE_MAX:
+        try:
+            response = confluence.get_all_spaces(start=start, limit=_SPACE_PAGE)
+        except HTTPError as exc:
+            raise _http_error("space listing", "rest/api/space", exc) from exc
+
+        batch = response.get("results", []) if isinstance(response, dict) else response
+        batch = [s for s in (batch or []) if isinstance(s, dict)]
+        yield from batch
+        if len(batch) < _SPACE_PAGE:
+            return
+        start += _SPACE_PAGE
 
 
 def register(mcp: FastMCP) -> None:
@@ -392,9 +441,9 @@ def register(mcp: FastMCP) -> None:
             page: The page id (``123456``) or any page URL — ``…?pageId=123``,
                 ``…/pages/123/Title`` and ``…/display/SPACE/Title`` all work.
             space: Space key, when identifying the page by title.
-            title: Exact page title, used together with ``space``. Titles are
-                case-sensitive and must match in full — prefer
-                ``search_confluence`` to find the page, then pass its id.
+            title: Exact page title, used together with ``space``. The whole
+                title has to match — prefer ``search_confluence`` to find the
+                page, then pass its id.
             format: ``markdown`` (default), ``text`` (no markup at all),
                 ``html`` (the rendered body) or ``storage`` (Confluence's raw
                 XHTML source — needed only to edit a page elsewhere).
@@ -464,7 +513,7 @@ def register(mcp: FastMCP) -> None:
         # An id (or a URL carrying one) needs no lookup — only a title does.
         page_id, space, title = _identify(page, space, title)
         if page_id:
-            parent = {"id": page_id, "title": title}
+            parent = {"id": page_id, "title": title} if title else {"id": page_id}
         else:
             resolved = _fetch_page(None, space, title, "version")
             parent = {"id": str(resolved.get("id")), "title": resolved.get("title")}
@@ -495,27 +544,23 @@ def register(mcp: FastMCP) -> None:
     ) -> list[dict[str, Any]]:
         """List Confluence spaces — how to find the ``space`` key to search in.
 
+        The whole space directory is walked, so ``query`` matches across the
+        instance and not just the first page of spaces.
+
         Args:
             query: Only return spaces whose key or name contains this substring
                 (case-insensitive).
-            limit: Maximum spaces to fetch from the server (default 100).
+            limit: Maximum spaces to return (default 100). Searching stops as
+                soon as this many match.
             include_personal: Include personal spaces (``~username``), which are
                 excluded by default because they crowd out team spaces.
 
         Returns each space's ``key``, ``name``, ``type`` and ``url``.
         """
-        try:
-            response = get_confluence().get_all_spaces(limit=limit)
-        except HTTPError as exc:
-            raise _http_error("space listing", "rest/api/space", exc) from exc
-
-        items = response.get("results", []) if isinstance(response, dict) else response
         needle = query.strip().lower() if query else None
 
         spaces = []
-        for space in items or []:
-            if not isinstance(space, dict):
-                continue
+        for space in _iter_spaces():
             if not include_personal and space.get("type") == "personal":
                 continue
             key = str(space.get("key") or "")
@@ -530,4 +575,6 @@ def register(mcp: FastMCP) -> None:
                     "url": _page_url(space),
                 }
             )
+            if len(spaces) >= limit:
+                break
         return spaces

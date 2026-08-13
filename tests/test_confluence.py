@@ -97,15 +97,31 @@ def test_to_markdown_keeps_structure_and_absolutises_links() -> None:
     assert "* one" in markdown
 
 
+def test_to_markdown_leaves_already_addressable_links_alone() -> None:
+    html = (
+        "<p><a href='mailto:ann@example.com'>mail</a>"
+        "<a href='https://other.example.com/x'>ext</a>"
+        "<a href='#anchor'>here</a></p>"
+    )
+    markdown = confluence._to_markdown(html)
+    assert "(mailto:ann@example.com)" in markdown
+    assert "(https://other.example.com/x)" in markdown
+    assert "(#anchor)" in markdown
+
+
+def test_to_markdown_does_not_escape_ordinary_punctuation() -> None:
+    assert confluence._to_markdown("<p>*1. Дата* и snake_case</p>") == "*1. Дата* и snake_case"
+
+
 def test_render_falls_back_to_storage_when_the_view_body_is_absent() -> None:
     page = {"body": {"storage": {"value": "<p>plain</p>"}}}
     assert confluence._render(page, "markdown") == "plain"
 
 
-def test_search_hit_strips_highlight_markers() -> None:
+def test_search_hit_strips_highlight_markers_and_unescapes_entities() -> None:
     hit = {
         "title": "@@@hl@@@Release@@@endhl@@@ checklist",
-        "excerpt": "before @@@hl@@@release@@@endhl@@@ after",
+        "excerpt": "before &quot;@@@hl@@@release@@@endhl@@@&quot; after",
         "url": "/display/ENG/Release+Checklist",
         "lastModified": "2026-08-01T10:00:00.000+03:00",
         "content": {"id": "42", "type": "page", "space": {"key": "ENG", "name": "Engineering"}},
@@ -117,9 +133,30 @@ def test_search_hit_strips_highlight_markers() -> None:
         "space_key": "ENG",
         "space_name": "Engineering",
         "url": "https://wiki.example.com/display/ENG/Release+Checklist",
-        "excerpt": "before release after",
+        "excerpt": 'before "release" after',
         "last_modified": "2026-08-01T10:00:00.000+03:00",
     }
+
+
+def test_iter_spaces_walks_past_the_first_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A space named on page two must still be findable — the whole point of paging."""
+    calls: list[tuple[int, int]] = []
+
+    class FakeClient:
+        url = "https://wiki.example.com"
+
+        def get_all_spaces(self, start=0, limit=100, **kwargs):
+            calls.append((start, limit))
+            if start == 0:
+                full = [{"key": f"S{i}", "type": "global"} for i in range(confluence._SPACE_PAGE)]
+                return {"results": full}
+            return {"results": [{"key": "LENTA", "name": "Лента", "type": "global"}]}
+
+    monkeypatch.setattr(confluence, "get_confluence", FakeClient)
+    keys = [space["key"] for space in confluence._iter_spaces()]
+
+    assert calls == [(0, confluence._SPACE_PAGE), (confluence._SPACE_PAGE, confluence._SPACE_PAGE)]
+    assert keys[-1] == "LENTA"
 
 
 def test_page_meta_flattens_version_and_history() -> None:
