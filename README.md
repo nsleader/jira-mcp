@@ -1,6 +1,7 @@
 # jira-mcp
 
-MCP-сервер для доступа к **Jira Server / Data Center** через
+MCP-сервер для доступа к **Jira Server / Data Center** (и, опционально, к
+**Confluence Server / DC**) через
 [`atlassian-python-api`](https://github.com/atlassian-api/atlassian-python-api).
 Аутентификация — Personal Access Token (Bearer). Транспорт — stdio.
 
@@ -36,8 +37,16 @@ uvx --from git+https://github.com/nsleader/jira-mcp.git@v0.1.0 jira-mcp
 | `JIRA_PERSONAL_TOKEN` | да          | —            | Personal Access Token (Bearer)            |
 | `JIRA_SSL_VERIFY`     | нет         | `true`       | Проверка TLS-сертификата                  |
 | `JIRA_TIMEOUT`        | нет         | `75`         | Таймаут запроса, сек                      |
+| `CONFLUENCE_URL`      | для Confluence | —         | Базовый URL Confluence, напр. `https://wiki.example.com` |
+| `CONFLUENCE_PERSONAL_TOKEN` | нет   | `JIRA_PERSONAL_TOKEN` | Отдельный PAT Confluence            |
+| `CONFLUENCE_SSL_VERIFY` | нет       | как у Jira   | Проверка TLS-сертификата                  |
+| `CONFLUENCE_TIMEOUT`  | нет         | как у Jira   | Таймаут запроса, сек                      |
 
-PAT создаётся в Jira: **Profile → Personal Access Tokens**.
+PAT создаётся в Jira: **Profile → Personal Access Tokens**; в Confluence — там же
+в своём профиле. Confluence — отдельное приложение со своим адресом и, как
+правило, своим токеном, поэтому `CONFLUENCE_URL` из `JIRA_URL` не выводится.
+Без него сервер работает как обычно, а confluence-инструменты возвращают
+понятную ошибку о ненастроенном подключении.
 
 ## Запуск
 
@@ -57,6 +66,10 @@ claude mcp add jira \
   -e JIRA_PERSONAL_TOKEN=your-personal-access-token \
   -- uvx --from git+https://github.com/nsleader/jira-mcp.git jira-mcp
 ```
+
+Чтобы включить инструменты Confluence, добавьте туда же
+`-e CONFLUENCE_URL=https://wiki.example.com` и (если токен отдельный)
+`-e CONFLUENCE_PERSONAL_TOKEN=your-confluence-token`.
 
 ## Подключение к Claude Desktop
 
@@ -98,19 +111,24 @@ claude mcp add jira \
 | `get_team_members`     | Все участники команды Tempo (ключ, имя, роль, период членства)   |
 | `get_user_plan`        | Планы Tempo Planner: на какие проекты и на сколько часов в день запланирован пользователь |
 | `get_users_plan`       | Планы Tempo Planner по списку пользователей за один запрос, с разбивкой по каждому |
+| `search_confluence`    | Поиск страниц Confluence: текст, пространство, метка (CQL под капотом) |
+| `get_confluence_page`  | Прочитать страницу по id / ссылке / `space` + `title` — тело в Markdown |
+| `get_confluence_page_children` | Дочерние страницы — обход дерева пространства вниз          |
+| `get_confluence_spaces` | Список пространств Confluence (ключи для поиска)                 |
 
 ## Структура
 
 ```
 src/jira_mcp/
 ├── config.py        # настройки из окружения (pydantic-settings)
-├── client.py        # фабрика Jira-клиента (кеш)
+├── client.py        # фабрики Jira- и Confluence-клиентов (кеш)
 ├── server.py        # FastMCP + main()
 └── tools/
     ├── issues.py    # инструменты по задачам + create_issue
     ├── projects.py  # проекты и роли проекта (get_project_roles)
     ├── worklogs.py  # отчёты по времени (Tempo Timesheets) + add_worklog
-    └── tempo.py     # Tempo Planner: планирование (get_user_plan)
+    ├── tempo.py     # Tempo Planner: планирование (get_user_plan)
+    └── confluence.py # поиск и чтение статей Confluence
 ```
 
 ## Создание задач
@@ -161,6 +179,36 @@ src/jira_mcp/
 разбивка по дням не учитывает выходные и праздники — так же, как сам Tempo.
 На Server/DC это плагин Jira: работает тот же `JIRA_URL` и PAT, отдельный
 Tempo-токен не нужен.
+
+## Confluence
+
+Четыре инструмента только на чтение: найти статью и прочитать её.
+
+**Поиск.** `search_confluence` собирает CQL из обычных аргументов —
+`query` (полнотекстовый `text ~`), `space`, `label`, `content_type` — и по
+умолчанию сортирует по релевантности; `newest_first=true` переключает на
+«что менялось недавно». Для запросов, которые сигнатурой не выразить
+(`creator = jsmith AND lastmodified > -7d`), есть параметр `cql` — он идёт на
+сервер как есть. Маркеры подсветки совпадений (`@@@hl@@@`), которые Server
+подмешивает в заголовок и excerpt, вычищаются. В ответе `total` — общее число
+совпадений, а не размер выданной страницы результатов.
+
+**Чтение.** `get_confluence_page` принимает id, любую ссылку на страницу
+(`?pageId=123`, `/pages/123/Title`, `/display/SPACE/Title`) либо пару
+`space` + `title`. Тело берётся из отрендеренного `body.view` (макросы уже
+раскрыты) и конвертируется в Markdown: заголовки, списки, таблицы и блоки кода
+сохраняются, разметка макросов — нет; относительные ссылки достраиваются до
+абсолютных. Другие варианты — `format="text"`, `"html"` и `"storage"`
+(исходный XHTML, нужен только чтобы где-то отредактировать страницу).
+
+Длинные статьи режутся по `max_chars` (по умолчанию 20000), чтобы не забивать
+контекст: в ответе есть `content_chars`, `truncated` и `next_offset` —
+следующий кусок читается тем же инструментом с `offset`.
+
+Рядом с текстом возвращается контекст статьи: пространство, версия, кто и когда
+менял, метки и хлебные крошки `ancestors`. Вниз по дереву —
+`get_confluence_page_children`; ключи пространств — `get_confluence_spaces`
+(персональные `~user` скрыты, если не попросить `include_personal`).
 
 ## Разработка
 

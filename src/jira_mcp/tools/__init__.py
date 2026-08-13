@@ -8,12 +8,13 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from . import issues, projects, teams, tempo, users, worklogs
+from . import confluence, issues, projects, teams, tempo, users, worklogs
 
 
 def register_all(mcp: FastMCP) -> None:
     """Register every tool module on the given FastMCP instance."""
     issues.register(mcp)
+    confluence.register(mcp)
     projects.register(mcp)
     users.register(mcp)
     worklogs.register(mcp)
