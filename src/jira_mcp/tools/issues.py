@@ -1,14 +1,20 @@
-"""Jira issue tools: reading, commenting and creating issues.
+"""Jira issue tools: reading, commenting, creating and transitioning issues.
 
 These illustrate the pattern for all Jira tools: typed arguments, a docstring
 that the LLM sees as the tool description, structured return values, and Jira
 errors surfaced as readable messages instead of raw tracebacks.
 
-``create_issue`` is the write here. On Server/DC the agile hierarchy does not
+``create_issue`` is a write here. On Server/DC the agile hierarchy does not
 live in plain fields: an Epic needs its "Epic Name" custom field, and a task is
 attached to an epic through the "Epic Link" custom field. Both ids differ per
 instance (``customfield_10105`` on one Jira, ``customfield_12001`` on the next),
 so they are discovered once from ``/field`` by their Greenhopper schema type.
+
+``transition_issue`` is the other write. A status cannot be assigned directly on
+Server/DC — it is the *result* of a workflow transition, and which transitions
+exist depends on the issue's current status, its workflow and the token owner's
+permissions. So the available transitions are always read first, which is also
+what turns "no such status" into a message listing the reachable ones.
 """
 
 from __future__ import annotations
@@ -187,6 +193,109 @@ def _build_fields(
     return fields
 
 
+def _parse_transitions(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Flatten ``GET /issue/{key}/transitions`` into id / name / target triples.
+
+    ``required_fields`` is only populated when the request expanded
+    ``transitions.fields``. It matters because a transition behind a screen
+    ("Resolve Issue" asking for a resolution) rejects the POST with a 400 unless
+    that field comes along, and the field ids are instance-specific.
+    """
+    raw = (payload or {}).get("transitions")
+    transitions: list[dict[str, Any]] = []
+    for transition in raw if isinstance(raw, list) else []:
+        if not isinstance(transition, dict) or not transition.get("id"):
+            continue
+        to = transition.get("to") if isinstance(transition.get("to"), dict) else {}
+        category = to.get("statusCategory") if isinstance(to.get("statusCategory"), dict) else {}
+        fields = transition.get("fields") if isinstance(transition.get("fields"), dict) else {}
+        transitions.append(
+            {
+                "id": str(transition["id"]),
+                "name": transition.get("name"),
+                "to_status": to.get("name"),
+                "to_status_category": category.get("name"),
+                "required_fields": sorted(
+                    field_id
+                    for field_id, spec in fields.items()
+                    if isinstance(spec, dict) and spec.get("required")
+                ),
+            }
+        )
+    return transitions
+
+
+def _match_transition(
+    transitions: list[dict[str, Any]], target: str
+) -> dict[str, Any] | None:
+    """Find the transition meant by ``target``, or ``None``.
+
+    Callers name a status ("Ready For Test"), a transition ("Start Progress") or
+    an id, and the three namespaces overlap — a transition called "Done" may lead
+    to a status called "Closed". Target status wins, because that is what a
+    request to "change the status" is about; the transition name is the fallback
+    for workflows whose buttons are named differently from their outcomes.
+    """
+    wanted = target.strip().lower()
+    if not wanted:
+        raise ValueError("target must not be empty")
+    for key in ("to_status", "name", "id"):
+        for transition in transitions:
+            if str(transition.get(key) or "").strip().lower() == wanted:
+                return transition
+    return None
+
+
+def _describe_transitions(transitions: list[dict[str, Any]]) -> str:
+    """Render the reachable statuses for an error message."""
+    return (
+        ", ".join(
+            f"'{t['to_status']}' (transition '{t['name']}', id {t['id']})" for t in transitions
+        )
+        or "(none — the workflow offers this user no transition from here)"
+    )
+
+
+def _transition_payload(
+    transition_id: str, fields: dict[str, Any] | None, comment: str | None
+) -> dict[str, Any]:
+    """Build the body of ``POST /issue/{key}/transitions``.
+
+    A comment goes into ``update``, not ``fields``: on a transition screen the
+    comment is an *add* operation on the comment list, and passing it as a field
+    is rejected.
+    """
+    payload: dict[str, Any] = {"transition": {"id": transition_id}}
+    if fields:
+        payload["fields"] = fields
+    if comment:
+        payload["update"] = {"comment": [{"add": {"body": comment}}]}
+    return payload
+
+
+def _current_status(issue_key: str) -> str | None:
+    """Return the issue's status name, or ``None`` if Jira did not report one."""
+    try:
+        issue = get_jira().issue(issue_key, fields="status")
+    except HTTPError as exc:
+        raise _http_error("Status lookup", f"rest/api/2/issue/{issue_key}", exc, {}) from exc
+    fields = issue.get("fields") if isinstance(issue, dict) else None
+    status = fields.get("status") if isinstance(fields, dict) else None
+    return status.get("name") if isinstance(status, dict) else None
+
+
+def _read_transitions(issue_key: str) -> list[dict[str, Any]]:
+    """Read the transitions available to the token owner from the current status."""
+    try:
+        payload = get_jira().get_issue_transitions_full(
+            issue_key, expand="transitions.fields"
+        )
+    except HTTPError as exc:
+        endpoint = f"rest/api/2/issue/{issue_key}/transitions"
+        raise _http_error("Transition lookup", endpoint, exc, {}) from exc
+    return _parse_transitions(payload if isinstance(payload, dict) else {})
+
+
 def register(mcp: FastMCP) -> None:
     """Attach issue tools to the FastMCP instance."""
 
@@ -264,6 +373,100 @@ def register(mcp: FastMCP) -> None:
             for t in types
             if isinstance(t, dict)
         ]
+
+    @mcp.tool()
+    def get_transitions(issue_key: str) -> dict[str, Any]:
+        """List the statuses an issue can be moved to right now.
+
+        Call this before ``transition_issue`` when unsure what the workflow
+        allows: the set depends on the current status, the project's workflow and
+        the token owner's permissions, and status names are instance-specific and
+        often localised. ``required_fields`` on a transition lists field ids that
+        must be passed to ``transition_issue`` (a resolution screen, typically).
+
+        Args:
+            issue_key: The issue key, e.g. ``PROJ-123``.
+        """
+        key = issue_key.strip().upper()
+        return {
+            "issue_key": key,
+            "current_status": _current_status(key),
+            "transitions": _read_transitions(key),
+        }
+
+    @mcp.tool()
+    def transition_issue(
+        issue_key: str,
+        target: str,
+        comment: str | None = None,
+        resolution: str | None = None,
+        fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Change an issue's status by running a workflow transition.
+
+        CALL THIS TOOL STRICTLY ON THE USER'S EXPLICIT REQUEST. It changes a real
+        issue under the token owner's name, the change is visible to the whole
+        team (boards, notifications, automation), and this server cannot undo it —
+        the reverse transition may not even exist in the workflow. Never move an
+        issue on your own initiative: not because the work looks finished, not to
+        "tidy up" a board, not as an inferred step of another request. When
+        several issues are named at once, confirm the list with the user first.
+
+        Args:
+            issue_key: The issue key, e.g. ``PROJ-123``.
+            target: Where to move it. Preferably the target status name
+                (``Ready For Test``); a transition name (``Start Progress``) or a
+                numeric transition id also work. Matched case-insensitively,
+                target status first. Call ``get_transitions`` when unsure.
+            comment: Optional comment to add as part of the transition.
+            resolution: Resolution name (``Fixed``, ``Done``…) for transitions
+                that close an issue and require one.
+            fields: Raw field values for a transition screen that demands more,
+                keyed by field id — e.g. ``{"customfield_10200": "1.4.0"}``. See
+                ``required_fields`` from ``get_transitions``.
+
+        Returns the status before and after the change, plus the transition used.
+        A no-op (the issue is already in ``target``) returns ``changed: false``
+        instead of failing.
+        """
+        key = issue_key.strip().upper()
+        before = _current_status(key)
+        if before and before.strip().lower() == target.strip().lower():
+            return {
+                "issue_key": key,
+                "changed": False,
+                "status": before,
+                "detail": f"'{key}' is already in status '{before}' — nothing to do.",
+            }
+
+        transitions = _read_transitions(key)
+        transition = _match_transition(transitions, target)
+        if transition is None:
+            raise ValueError(
+                f"'{target}' is not reachable from status '{before}' on {key}. "
+                f"Available: {_describe_transitions(transitions)}"
+            )
+
+        payload_fields = dict(fields) if fields else {}
+        if resolution:
+            payload_fields["resolution"] = {"name": resolution}
+        payload = _transition_payload(transition["id"], payload_fields, comment)
+
+        jira = get_jira()
+        try:
+            jira.post(f"{jira.resource_url('issue')}/{key}/transitions", data=payload)
+        except HTTPError as exc:
+            endpoint = f"rest/api/2/issue/{key}/transitions"
+            raise _http_error("Transition", endpoint, exc, payload) from exc
+
+        return {
+            "issue_key": key,
+            "changed": True,
+            "from_status": before,
+            "status": _current_status(key),
+            "transition": {"id": transition["id"], "name": transition["name"]},
+            "url": f"{jira.url.rstrip('/')}/browse/{key}",
+        }
 
     @mcp.tool()
     def create_issue(
