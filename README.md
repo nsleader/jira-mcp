@@ -82,7 +82,7 @@ claude mcp add jira \
   "mcpServers": {
     "jira": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/nsleader/jira-mcp.git", "jira-mcp"],
+      "args": ["--refresh", "--from", "git+https://github.com/nsleader/jira-mcp.git", "jira-mcp"],
       "env": {
         "JIRA_URL": "https://jira.example.com",
         "JIRA_PERSONAL_TOKEN": "your-personal-access-token"
@@ -95,6 +95,10 @@ claude mcp add jira \
 Claude Desktop запускает MCP-серверы с урезанным `PATH`, поэтому `"command": "uvx"`
 у многих не находится (`spawn uvx ENOENT`). В этом случае укажите абсолютный путь,
 например `/Users/<пользователь>/.local/bin/uvx` или `/opt/homebrew/bin/uvx`.
+
+`--refresh` заставляет `uvx` перечитать HEAD репозитория на каждом старте: иначе
+сборка берётся из кэша и установка остаётся на том коммите, на котором была
+поставлена. Стоит это меньше секунды, но требует доступа к GitHub при запуске.
 
 ## Доступные инструменты
 
