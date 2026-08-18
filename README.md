@@ -73,7 +73,9 @@ claude mcp add jira \
 
 ## Подключение к Claude Desktop
 
-В `claude_desktop_config.json`:
+Пошаговая инструкция для чистого Mac и пользователя без опыта разработки —
+[docs/install-macos-claude-desktop.md](docs/install-macos-claude-desktop.md).
+Короткий вариант — в `claude_desktop_config.json`:
 
 ```json
 {
@@ -89,6 +91,10 @@ claude mcp add jira \
   }
 }
 ```
+
+Claude Desktop запускает MCP-серверы с урезанным `PATH`, поэтому `"command": "uvx"`
+у многих не находится (`spawn uvx ENOENT`). В этом случае укажите абсолютный путь,
+например `/Users/<пользователь>/.local/bin/uvx` или `/opt/homebrew/bin/uvx`.
 
 ## Доступные инструменты
 
