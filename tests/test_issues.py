@@ -101,3 +101,46 @@ def test_transition_payload_puts_the_comment_in_update() -> None:
 
 def test_transition_payload_omits_empty_parts() -> None:
     assert issues._transition_payload("11", {}, None) == {"transition": {"id": "11"}}
+
+
+_FIELD_NAMES = {
+    "customfield_12001": "Описание пресейла",
+    "customfield_11704": "Story Points",
+}
+
+
+def test_name_custom_fields_names_the_filled_ones_and_drops_the_rest() -> None:
+    """Jira returns every custom field on the instance — почти все пустые."""
+    assert issues._name_custom_fields(
+        {
+            "summary": "Ретраинг",
+            "description": None,
+            "customfield_12001": "Текст пресейла",
+            "customfield_11704": None,
+            "customfield_10000": [],
+        },
+        _FIELD_NAMES,
+    ) == {
+        "summary": "Ретраинг",
+        "description": None,
+        "Описание пресейла (customfield_12001)": "Текст пресейла",
+    }
+
+
+def test_name_custom_fields_keeps_an_unknown_field_under_its_id() -> None:
+    # Поле завели между вызовами — лучше отдать его как есть, чем потерять.
+    assert issues._name_custom_fields({"customfield_99999": "x"}, _FIELD_NAMES) == {
+        "customfield_99999": "x"
+    }
+
+
+def test_name_custom_fields_keeps_falsy_but_real_values() -> None:
+    # Ноль и False — это ответ поля, а не его отсутствие.
+    assert issues._name_custom_fields(
+        {"customfield_11704": 0, "customfield_12001": False}, _FIELD_NAMES
+    ) == {"Story Points (customfield_11704)": 0, "Описание пресейла (customfield_12001)": False}
+
+
+def test_name_custom_fields_survives_a_junk_response() -> None:
+    assert issues._name_custom_fields(None, _FIELD_NAMES) is None
+    assert issues._name_custom_fields("nonsense", _FIELD_NAMES) == "nonsense"

@@ -19,6 +19,7 @@ what turns "no such status" into a message listing the reachable ones.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 
@@ -34,20 +35,24 @@ _EPIC_LINK_SCHEMA = "com.pyxis.greenhopper.jira:gh-epic-link"
 
 
 @lru_cache(maxsize=1)
-def _agile_field_ids() -> dict[str, str]:
-    """Return ``{"epic_name": id, "epic_link": id}`` for this Jira instance.
+def _all_fields() -> list[dict[str, Any]]:
+    """Every field defined on the instance, cached.
 
-    Cached: the field layout does not change between calls of a session, and
-    ``/field`` returns every field on the instance (hundreds of them).
+    ``/field`` returns hundreds of entries and the layout does not change
+    between calls of a session, so both readers below share one request.
     """
     try:
         fields = get_jira().get_all_fields() or []
     except HTTPError as exc:
         raise _http_error("Field lookup", "rest/api/2/field", exc, {}) from exc
+    return [f for f in fields if isinstance(f, dict)] if isinstance(fields, list) else []
 
+
+def _agile_field_ids() -> dict[str, str]:
+    """Return ``{"epic_name": id, "epic_link": id}`` for this Jira instance."""
     ids: dict[str, str] = {}
-    for field in fields if isinstance(fields, list) else []:
-        if not isinstance(field, dict) or not field.get("id"):
+    for field in _all_fields():
+        if not field.get("id"):
             continue
         schema = field.get("schema") if isinstance(field.get("schema"), dict) else {}
         custom = schema.get("custom")
@@ -57,6 +62,42 @@ def _agile_field_ids() -> dict[str, str]:
         elif custom == _EPIC_LINK_SCHEMA or (custom is None and name == "epic link"):
             ids.setdefault("epic_link", field["id"])
     return ids
+
+
+def _custom_field_names() -> dict[str, str]:
+    """``{"customfield_12001": "Описание пресейла"}`` for this instance."""
+    return {
+        field["id"]: str(field.get("name")).strip()
+        for field in _all_fields()
+        if str(field.get("id", "")).startswith("customfield_") and field.get("name")
+    }
+
+
+def _name_custom_fields(fields: Any, names: Mapping[str, str]) -> Any:
+    """Give ``customfield_*`` keys their human names and drop the empty ones.
+
+    Jira returns every custom field defined on the instance, so one issue
+    carries a hundred ``customfield_11704: null`` entries and the two that are
+    actually filled in look exactly like them. A model reading that sees an
+    empty ``description`` and reports the issue has none — while the text sits
+    in something like "Описание пресейла", which on many instances is where
+    descriptions really live.
+
+    The id stays inside the key: writes address fields by id, not by name
+    (``extra_fields`` of ``create_issue``, transition screens).
+    """
+    if not isinstance(fields, dict):
+        return fields
+    named: dict[str, Any] = {}
+    for key, value in fields.items():
+        if not key.startswith("customfield_"):
+            named[key] = value
+            continue
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+        name = names.get(key)
+        named[f"{name} ({key})" if name else key] = value
+    return named
 
 
 @lru_cache(maxsize=1)
@@ -303,22 +344,41 @@ def register(mcp: FastMCP) -> None:
     def get_issue(issue_key: str, fields: str | None = None) -> dict[str, Any]:
         """Get a single Jira issue by key (e.g. ``PROJ-123``).
 
+        Custom fields come back under their human names with the id kept in
+        the key ("Описание пресейла (customfield_12001)"), and the empty ones
+        are dropped. Do read them: instances put real content — descriptions
+        above all — into custom fields, and as bare ids they are
+        indistinguishable from the hundred nulls around them.
+
         Args:
             issue_key: The issue key, e.g. ``PROJ-123``.
             fields: Optional comma-separated list of fields to return
                 (e.g. ``summary,status,assignee``). Defaults to all fields.
         """
-        return get_jira().issue(issue_key, fields=fields)
+        issue = get_jira().issue(issue_key, fields=fields)
+        if isinstance(issue, dict) and "fields" in issue:
+            names = _custom_field_names()
+            issue["fields"] = _name_custom_fields(issue["fields"], names)
+        return issue
 
     @mcp.tool()
     def search_issues(jql: str, limit: int = 50) -> dict[str, Any]:
         """Search issues with a JQL query.
 
+        Custom fields are named and stripped of empties the same way as in
+        ``get_issue`` — over a page of results that is most of the payload.
+
         Args:
             jql: A JQL query, e.g. ``project = PROJ AND status = "In Progress"``.
             limit: Maximum number of issues to return (default 50).
         """
-        return get_jira().jql(jql, limit=limit)
+        result = get_jira().jql(jql, limit=limit)
+        if isinstance(result, dict) and isinstance(result.get("issues"), list):
+            names = _custom_field_names()
+            for issue in result["issues"]:
+                if isinstance(issue, dict) and "fields" in issue:
+                    issue["fields"] = _name_custom_fields(issue["fields"], names)
+        return result
 
     @mcp.tool()
     def add_comment(issue_key: str, comment: str) -> dict[str, Any]:
