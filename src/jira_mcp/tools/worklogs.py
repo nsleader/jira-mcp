@@ -26,6 +26,7 @@ from mcp.server.fastmcp import FastMCP
 from requests import HTTPError
 
 from ..client import get_jira
+from ..identity import display_name, unknown_users_warning, worker_key
 
 _VALID_DIMS = {"day", "project", "issue", "account"}
 
@@ -74,6 +75,30 @@ def _worklog_worker_display(worklog: dict[str, Any]) -> str | None:
         if name:
             return name
     return worklog.get("workerDisplayName") or worklog.get("workerFullName")
+
+
+def _resolve_workers(users: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Turn caller-supplied logins/keys into Tempo worker keys, de-duplicated.
+
+    Tempo's ``worker`` filter matches the user *key*, so a login silently
+    matches nothing (see :mod:`jira_mcp.identity`). De-duplication matters
+    because the same person can arrive twice under both handles — as a worker
+    key twice over they would seed two rows for one human.
+
+    Also returns the readable names Jira knows for those keys: worklogs
+    themselves often carry no display name, and a report keyed by ``JIRAUSER…``
+    is unreadable.
+    """
+    keys: list[str] = []
+    displays: dict[str, str] = {}
+    for user in users:
+        key = worker_key(user)
+        if key not in keys:
+            keys.append(key)
+        name = display_name(user)
+        if name:
+            displays[key] = name
+    return keys, displays
 
 
 def _worklog_account(worklog: dict[str, Any]) -> tuple[str, str | None]:
@@ -572,7 +597,9 @@ def register(mcp: FastMCP) -> None:
         server-side.
 
         Args:
-            username: Tempo worker (Jira username / key).
+            username: The person — either their Jira login (``acutina``) or
+                their user key (``JIRAUSER18613``). Tempo itself only matches
+                the key; the login is resolved to it here, so both work.
             date_from: Start date, inclusive, ``YYYY-MM-DD``.
             date_to: End date, inclusive, ``YYYY-MM-DD``.
             project: Optional project key to restrict to (e.g. ``PROJ``).
@@ -585,7 +612,8 @@ def register(mcp: FastMCP) -> None:
                 ``Absence`` account). Off by default so totals match Tempo.
         """
         dims = _parse_breakdown(breakdown)
-        worklogs = _fetch_worklogs([username], date_from, date_to, project)
+        worker = worker_key(username)
+        worklogs = _fetch_worklogs([worker], date_from, date_to, project)
         absence_seconds = 0
         if exclude_absence:
             worklogs, absence_seconds = _split_absence(worklogs)
@@ -593,6 +621,8 @@ def register(mcp: FastMCP) -> None:
 
         result: dict[str, Any] = {
             "user": username,
+            "worker_key": worker,
+            "display": display_name(username),
             "date_from": date_from,
             "date_to": date_to,
             "project": project,
@@ -603,6 +633,9 @@ def register(mcp: FastMCP) -> None:
             "worklog_count": len(worklogs),
         }
         result.update(_render_breakdowns(agg, dims))
+        warning = unknown_users_warning([username])
+        if warning:
+            result["warnings"] = [warning]
         return result
 
     @mcp.tool()
@@ -624,7 +657,10 @@ def register(mcp: FastMCP) -> None:
         per user).
 
         Args:
-            usernames: Tempo workers (Jira usernames / keys).
+            usernames: The people — Jira logins (``acutina``) or user keys
+                (``JIRAUSER18613``), mixed freely; logins are resolved to keys
+                here, which is what Tempo matches on. ``by_user`` is keyed by
+                the resolved key and carries the person's ``display`` name.
             date_from: Start date, inclusive, ``YYYY-MM-DD``.
             date_to: End date, inclusive, ``YYYY-MM-DD``.
             project: Optional project key to restrict to (e.g. ``PROJ``).
@@ -637,18 +673,20 @@ def register(mcp: FastMCP) -> None:
         if not usernames:
             raise ValueError("usernames must not be empty")
         dims = _parse_breakdown(breakdown)
-        worklogs = _fetch_worklogs(usernames, date_from, date_to, project)
+        workers, displays = _resolve_workers(usernames)
+        worklogs = _fetch_worklogs(workers, date_from, date_to, project)
         absence_seconds = 0
         if exclude_absence:
             worklogs, absence_seconds = _split_absence(worklogs)
         agg = _aggregate(worklogs)
 
         # Ensure every requested user appears, even with zero logged time.
-        for user in usernames:
-            agg.by_worker.setdefault(user, 0)
+        for worker in workers:
+            agg.by_worker.setdefault(worker, 0)
 
         result: dict[str, Any] = {
             "users": usernames,
+            "worker_keys": workers,
             "date_from": date_from,
             "date_to": date_to,
             "project": project,
@@ -660,7 +698,11 @@ def register(mcp: FastMCP) -> None:
         }
         if "account" in dims:
             agg.account_name = {**_fetch_account_names(), **agg.account_name}
-        result["by_user"] = _render_users(agg, dims, agg.worker_display)
+        # Tempo's own name wins when it attached one; Jira's fills the rest.
+        result["by_user"] = _render_users(agg, dims, {**displays, **agg.worker_display})
+        warning = unknown_users_warning(usernames)
+        if warning:
+            result["warnings"] = [warning]
         if "account" in dims:
             result["by_account"] = _account_map(agg.by_account, agg.account_name)
         return result

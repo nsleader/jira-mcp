@@ -32,6 +32,7 @@ from mcp.server.fastmcp import FastMCP
 from requests import HTTPError
 
 from ..client import get_jira
+from ..identity import planner_login, unknown_users_warning
 
 _ALLOCATION_PATH = "rest/tempo-planning/1/allocation"
 _SCHEDULE_PATH = "rest/tempo-core/1/user/schedule"
@@ -261,6 +262,22 @@ def _aggregate_user(
     return agg, working_days
 
 
+def _resolve_assignees(users: list[str]) -> list[str]:
+    """Turn caller-supplied logins/keys into Planner assignee logins.
+
+    ``assigneeKeys`` and the schedule endpoint both match the *login*, not the
+    user key — a ``JIRAUSER…`` string matches no allocation and 404s the
+    schedule (see :mod:`jira_mcp.identity`). De-duplicated because the same
+    person may arrive under both handles.
+    """
+    logins: list[str] = []
+    for user in users:
+        login = planner_login(user)
+        if login not in logins:
+            logins.append(login)
+    return logins
+
+
 def _parse_range(date_from: str, date_to: str) -> tuple[date, date]:
     """Validate and parse the inclusive date range."""
     range_from = date.fromisoformat(date_from)
@@ -289,7 +306,9 @@ def register(mcp: FastMCP) -> None:
         are excluded exactly as Tempo itself does.
 
         Args:
-            username: Jira username / login (Tempo assignee key).
+            username: The person — either their Jira login (``acutina``) or
+                their user key (``JIRAUSER18613``). Planner itself only matches
+                the login; the key is resolved to it here, so both work.
             date_from: Start date, inclusive, ``YYYY-MM-DD``.
             date_to: End date, inclusive, ``YYYY-MM-DD``.
             breakdown: Pass ``day`` to add ``by_day`` — planned hours for each
@@ -304,13 +323,15 @@ def register(mcp: FastMCP) -> None:
             raise ValueError("breakdown must be omitted or 'day'")
         range_from, range_to = _parse_range(date_from, date_to)
 
-        allocations = _fetch_allocations([username], date_from, date_to)
+        login = planner_login(username)
+        allocations = _fetch_allocations([login], date_from, date_to)
         agg, working_days = _aggregate_user(
-            username, allocations, date_from, date_to, range_from, range_to
+            login, allocations, date_from, date_to, range_from, range_to
         )
 
         result: dict[str, Any] = {
             "user": username,
+            "login": login,
             "date_from": date_from,
             "date_to": date_to,
             "workdays": len(working_days),
@@ -322,8 +343,12 @@ def register(mcp: FastMCP) -> None:
         }
         if breakdown == "day":
             result["by_day"] = _render_days(agg)
-        if agg.warnings:
-            result["warnings"] = agg.warnings
+        warnings = list(agg.warnings)
+        unknown = unknown_users_warning([username])
+        if unknown:
+            warnings.insert(0, unknown)
+        if warnings:
+            result["warnings"] = warnings
         return result
 
     @mcp.tool()
@@ -342,7 +367,9 @@ def register(mcp: FastMCP) -> None:
         so weekends and public holidays are excluded exactly as Tempo does.
 
         Args:
-            usernames: Jira usernames / logins (Tempo assignee keys).
+            usernames: The people — Jira logins (``acutina``) or user keys
+                (``JIRAUSER18613``), mixed freely; keys are resolved to logins
+                here, which is what Planner matches on.
             date_from: Start date, inclusive, ``YYYY-MM-DD``.
             date_to: End date, inclusive, ``YYYY-MM-DD``.
             breakdown: Pass ``day`` to add ``by_day`` inside every user's
@@ -359,8 +386,9 @@ def register(mcp: FastMCP) -> None:
             raise ValueError("breakdown must be omitted or 'day'")
         range_from, range_to = _parse_range(date_from, date_to)
 
-        allocations = _fetch_allocations(usernames, date_from, date_to)
-        per_user: dict[str, list[dict[str, Any]]] = {u: [] for u in usernames}
+        logins = _resolve_assignees(usernames)
+        allocations = _fetch_allocations(logins, date_from, date_to)
+        per_user: dict[str, list[dict[str, Any]]] = {u: [] for u in logins}
         for alloc in allocations:
             per_user.setdefault(_alloc_assignee(alloc), []).append(alloc)
 
@@ -368,6 +396,9 @@ def register(mcp: FastMCP) -> None:
         all_projects: dict[str, int] = defaultdict(int)
         project_name: dict[str, str] = {}
         warnings: list[str] = []
+        unknown = unknown_users_warning(usernames)
+        if unknown:
+            warnings.append(unknown)
         by_user: dict[str, dict[str, Any]] = {}
 
         for username, user_allocs in per_user.items():
@@ -397,6 +428,7 @@ def register(mcp: FastMCP) -> None:
         )
         result: dict[str, Any] = {
             "users": usernames,
+            "logins": logins,
             "date_from": date_from,
             "date_to": date_to,
             "total_hours": _seconds_to_hours(total_seconds),
