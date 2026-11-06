@@ -15,6 +15,13 @@ Server/DC — it is the *result* of a workflow transition, and which transitions
 exist depends on the issue's current status, its workflow and the token owner's
 permissions. So the available transitions are always read first, which is also
 what turns "no such status" into a message listing the reachable ones.
+
+``assign_issue`` changes the assignee through the dedicated
+``PUT /issue/{key}/assignee`` endpoint, which needs only the "Assign Issues"
+permission — an edit of the ``assignee`` field would also need "Edit Issues"
+and the field on the edit screen. Server/DC identifies the person by *login*
+(``{"name": ...}``), so a user key is resolved to a login first; an unknown
+handle is refused up front rather than passed on for a bare HTTP 400.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from requests import HTTPError
 
+from .. import identity
 from ..client import get_jira
 
 # Stable Greenhopper schema ids of the two agile custom fields. The field *name*
@@ -337,6 +345,46 @@ def _read_transitions(issue_key: str) -> list[dict[str, Any]]:
     return _parse_transitions(payload if isinstance(payload, dict) else {})
 
 
+def _assignee_payload(login: str | None) -> dict[str, Any]:
+    """Body of ``PUT /issue/{key}/assignee``: ``name: null`` unassigns."""
+    return {"name": login}
+
+
+def _resolve_assignee(user: str | None) -> identity.Identity | None:
+    """Turn a login or user key into the account to assign; ``None`` = unassign.
+
+    Raises for a handle Jira knows no account for — most often a display name
+    ("Кутина Анастасия") passed where a login belongs.
+    """
+    value = (user or "").strip()
+    if not value:
+        return None
+    found = identity.resolve(value)
+    if found is None:
+        raise ValueError(
+            f"no Jira account matches '{value}'. assign_issue takes a login "
+            "('acutina') or a user key ('JIRAUSER18613'); find the person with "
+            "search_users first."
+        )
+    return found
+
+
+def _current_assignee(issue_key: str) -> dict[str, Any] | None:
+    """Return ``{login, display}`` of the current assignee, ``None`` if unassigned."""
+    try:
+        issue = get_jira().issue(issue_key, fields="assignee")
+    except HTTPError as exc:
+        raise _http_error("Assignee lookup", f"rest/api/2/issue/{issue_key}", exc, {}) from exc
+    fields = issue.get("fields") if isinstance(issue, dict) else None
+    assignee = fields.get("assignee") if isinstance(fields, dict) else None
+    if not isinstance(assignee, dict):
+        return None
+    return {
+        "login": assignee.get("name"),
+        "display": assignee.get("displayName"),
+    }
+
+
 def register(mcp: FastMCP) -> None:
     """Attach issue tools to the FastMCP instance."""
 
@@ -526,6 +574,62 @@ def register(mcp: FastMCP) -> None:
             "status": _current_status(key),
             "transition": {"id": transition["id"], "name": transition["name"]},
             "url": f"{jira.url.rstrip('/')}/browse/{key}",
+        }
+
+    @mcp.tool()
+    def assign_issue(issue_key: str, assignee: str | None) -> dict[str, Any]:
+        """Assign an existing issue to someone, reassign it, or unassign it.
+
+        CALL THIS TOOL STRICTLY ON THE USER'S EXPLICIT REQUEST. It changes a real
+        issue under the token owner's name and notifies the people involved.
+        Never (re)assign an issue on your own initiative: not because someone
+        seems to be working on it, not as an inferred step of another request.
+        When several issues are named at once, confirm the list with the user
+        first.
+
+        Args:
+            issue_key: The issue key, e.g. ``PROJ-123``.
+            assignee: The new assignee's login (``acutina``) or user key
+                (``JIRAUSER18613``). Not a display name — resolve one with
+                ``search_users`` first. ``None`` or an empty string removes the
+                assignee (only if the project allows unassigned issues).
+
+        Returns the assignee before and after. Assigning the person who already
+        holds the issue returns ``changed: false`` without a write.
+        """
+        key = issue_key.strip().upper()
+        target = _resolve_assignee(assignee)
+        before = _current_assignee(key)
+        before_login = before.get("login") if before else None
+        target_login = target.login if target else None
+
+        jira = get_jira()
+        url = f"{jira.url.rstrip('/')}/browse/{key}"
+        after = (
+            {"login": target.login, "display": target.display} if target else None
+        )
+        # Server/DC logins are case-insensitive.
+        if (before_login or "").lower() == (target_login or "").lower():
+            return {
+                "issue_key": key,
+                "changed": False,
+                "assignee": before,
+                "url": url,
+            }
+
+        payload = _assignee_payload(target_login)
+        endpoint = f"rest/api/2/issue/{key}/assignee"
+        try:
+            jira.put(endpoint, data=payload)
+        except HTTPError as exc:
+            raise _http_error("Assignment", endpoint, exc, payload) from exc
+
+        return {
+            "issue_key": key,
+            "changed": True,
+            "from_assignee": before,
+            "assignee": after,
+            "url": url,
         }
 
     @mcp.tool()

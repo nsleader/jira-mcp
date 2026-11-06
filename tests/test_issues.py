@@ -144,3 +144,25 @@ def test_name_custom_fields_keeps_falsy_but_real_values() -> None:
 def test_name_custom_fields_survives_a_junk_response() -> None:
     assert issues._name_custom_fields(None, _FIELD_NAMES) is None
     assert issues._name_custom_fields("nonsense", _FIELD_NAMES) == "nonsense"
+
+
+def test_assignee_payload_uses_the_login_and_null_to_unassign() -> None:
+    assert issues._assignee_payload("acutina") == {"name": "acutina"}
+    assert issues._assignee_payload(None) == {"name": None}
+
+
+def test_resolve_assignee_turns_a_key_into_the_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    known = issues.identity.Identity(login="acutina", key="JIRAUSER18613", display="Кутина")
+    monkeypatch.setattr(issues.identity, "resolve", lambda u: known)
+    assert issues._resolve_assignee(" JIRAUSER18613 ") == known
+
+
+def test_resolve_assignee_treats_empty_as_unassign() -> None:
+    assert issues._resolve_assignee(None) is None
+    assert issues._resolve_assignee("  ") is None
+
+
+def test_resolve_assignee_refuses_an_unknown_handle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(issues.identity, "resolve", lambda u: None)
+    with pytest.raises(ValueError, match="search_users"):
+        issues._resolve_assignee("Кутина Анастасия")
